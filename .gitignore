@@ -1,0 +1,56 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# VSCode / PyCharm / JetBrains IDEs
+.vscode/
+.idea/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Mac system files
+.DS_Store
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Docker-related
+*.pid
+
+# Ignore compiled Python files
+*.pyo
+*.pyd
+*.so
+
+# Ignore test output
+*.out
+
+# Environment variables or config
+.env
+.env.*
+
+# Ignore ollama models if locally stored
+ollama_models/
+
+# If using coverage tools
+htmlcov/
+.coverage
+coverage.xml
+.cache/
+
+# If using pipenv
+Pipfile.lock
+
+# If you generate a requirements.txt
+requirements.txt (optional if you're generating it on the fly)
+
+# __pycache__ inside Docker context
+**/__pycache__/
