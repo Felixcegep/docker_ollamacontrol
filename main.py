@@ -12,9 +12,7 @@ while True:
     usercommand = linux_command(demande_ia)
     print("commande utiliser :", usercommand)
 
-    if usercommand.strip() == "exit":
-        break
-    elif usercommand.startswith("cd "):
+    if usercommand.startswith("cd "):
         new_path = usercommand[3:].strip()
         # Vérifie si le dossier existe
         result = container.exec_run(f"bash -c 'cd {current_path} && cd {new_path} && pwd'", demux=True)
