@@ -1,93 +1,85 @@
-# ollama_model.py
+# Ollama_model.py
 import ollama
 import json
 
 
-def control_linux(linuxcommand):
-    """Simple function to acknowledge the command before it's used."""
-    print(f"🤖 AI proposed command: '{linuxcommand}'")
-    return linuxcommand
-
-
-# `conversation_messages` should be the LIST of {"role": ..., "content": ...} dicts
-# `current_path_for_context` is the string representing the current working directory in the container
-def linux_command(conversation_messages: list, current_path_for_context: str) -> str | None:
-    system_prompt_content = (
-        f"You are a command-line assistant. Your job is to provide exactly one simple Linux command based on the user's request.\n"
-        f"IMPORTANT: Your command will be executed as if you are already in the directory: '{current_path_for_context}'.\n"
-        f"Therefore, for commands like 'touch newfile.txt', 'mkdir newdir', or 'ls' targeting items within '{current_path_for_context}', "
-        f"use relative paths (e.g., 'touch newfile.txt', 'ls my_subdir'). Do NOT prepend '{current_path_for_context}/' to these relative paths.\n"
-        f"For 'cd' commands, you can use relative paths (e.g., 'cd ..', 'cd newfolder') or absolute paths (e.g., 'cd /etc').\n"
-        "\n"
-        "ALLOWED COMPLEXITY: You must provide exactly one command. However, this single command can include I/O redirection ('>', '>>') or a single simple pipe ('|') if it achieves a single conceptual goal.\n"
-        "Examples of single conceptual actions:\n"
-        "  - Creating/overwriting a file with content: {{ \"linuxcommand\": \"echo 'hello world' > file.txt\" }}\n"
-        "  - Appending to a file: {{ \"linuxcommand\": \"echo 'more text' >> file.txt\" }}\n"
-        "  - Listing files and filtering for 'txt': {{ \"linuxcommand\": \"ls -l | grep txt\" }}\n"
-        "\n"
-        "Respond with a valid JSON object with exactly one field:\n"
-        "- 'linuxcommand': a single Linux shell command. This command should be relative to '{current_path_for_context}' for most operations, unless an absolute path is explicitly needed (e.g., for 'cd /some/absolute/path').\n"
-        "\n"
-        "More Examples (assuming current path is /home/user):\n"
-        "User: create a directory called 'docs'\n"
-        "AI: {{ \"linuxcommand\": \"mkdir docs\" }}\n"
-        "User: go into docs\n"
-        "AI: {{ \"linuxcommand\": \"cd docs\" }}  (current path becomes /home/user/docs)\n"
-        "User: create a file report.txt\n"
-        "AI: {{ \"linuxcommand\": \"touch report.txt\" }}\n"
-        "User: add 'initial report' to report.txt\n"
-        "AI: {{ \"linuxcommand\": \"echo 'initial report' > report.txt\" }}\n"
-        "User: list files here\n"
-        "AI: {{ \"linuxcommand\": \"ls -l\" }}\n"
-        "User: go to /etc\n"
-        "AI: {{ \"linuxcommand\": \"cd /etc\" }} (current path becomes /etc)\n"
-        "\n"
-        "❌ Do NOT output explanations.\n"
-        "❌ Do NOT include multiple commands separated by ';' or '&&' (unless it's a single conceptual command with pipe/redirection as shown above).\n"
-        "✅ Output only the JSON object."
+def linux_command(conversation_messages: list, current_path: str) -> str | None:
+    """
+    Generates a single Linux command from a step description.
+    'conversation_messages' should be a list like: [{"role": "user", "content": "step description"}]
+    """
+    system_prompt = (
+        f"You are an AI assistant that generates a single, specific Linux command. "
+        f"You are operating inside a minimal Ubuntu Docker container with a root shell. "
+        f"The current working directory is '{current_path}'.\n\n"
+        f"**CRITICAL INSTRUCTIONS (MUST FOLLOW):**\n"
+        f"1.  **ROOT Shell Context:** You are running as root. Therefore, `sudo` is NOT required for any command, including `apt` package management. Using `sudo` will cause errors.\n"
+        f"2.  **JSON Output ONLY:** You MUST output ONLY a single JSON object and NOTHING ELSE. No introductory text, no explanations, no apologies, just the JSON. "
+        f"    This JSON object MUST contain exactly one key: `\"linuxcommand\"`. The value for this key MUST be a string containing the complete Linux command.\n"
+        f"    CORRECT Output Example: `{{\"linuxcommand\": \"ls -la\"}}`\n"
+        f"    INCORRECT Output Example 1: `Here is the command: {{\"linuxcommand\": \"ls -la\"}}` (Contains extra text before JSON)\n"
+        f"    INCORRECT Output Example 2: `{{\"command\": \"ls -la\"}}` (Wrong key name)\n"
+        f"    INCORRECT Output Example 3: `{{\"linuxcommand\": \"echo \\\"Hello\\\"\"}}` (Ensure proper JSON string escaping if command contains quotes)\n"
+        f"3.  **Command Specificity:** The command must directly and completely achieve the task described in the user's message (which represents one step of a plan from another AI).\n"
+        f"4.  **Paths:** Use relative paths for files/directories in '{current_path}' when appropriate. Use absolute paths if the step specifies them or for system directories (e.g., /tmp, /etc).\n\n"
+        f"**Examples based on user's step description (which is a plan step):**\n"
+        f"- User step: 'Create an empty directory named my_data in the current location.'\n"
+        f"  Your JSON Output: `{{\"linuxcommand\": \"mkdir my_data\"}}`\n"
+        f"- User step: 'List all files and folders, including hidden ones, with detailed information in the current directory.'\n"
+        f"  Your JSON Output: `{{\"linuxcommand\": \"ls -la\"}}`\n"
+        f"- User step: 'Change current directory to /opt/app.'\n"
+        f"  Your JSON Output: `{{\"linuxcommand\": \"cd /opt/app\"}}`\n"
+        f"- User step: 'Write the exact text \\'Final report content.\\' into a new file named final_report.txt in the current directory.'\n"  # Escaped for Python string
+        f"  Your JSON Output: `{{\"linuxcommand\": \"echo 'Final report content.' > final_report.txt\"}}`\n"
+        f"- User step: 'Update package lists and install the nano text editor using apt.'\n"
+        f"  Your JSON Output: `{{\"linuxcommand\": \"apt update && apt install -y nano\"}}`\n"
+        f"- User step: 'Check if bash shell is available and print its version.'\n"
+        f"  Your JSON Output: `{{\"linuxcommand\": \"bash --version\"}}`\n"
+        f"- User step: 'Start a bash shell.' (If this is the step, interpret as checking availability or a simple non-interactive command. This agent doesn't support interactive sub-shells.)\n"
+        f"  Your JSON Output: `{{\"linuxcommand\": \"bash -c 'echo Bash is available'\"}}`\n\n"
+        f"Adhere strictly to ALL these instructions. Generate ONLY the JSON object."
     )
 
-    # Construct the full message list for the API call
-    messages_for_ollama_api = [
-        {"role": "system", "content": system_prompt_content}
-    ]
-    messages_for_ollama_api.extend(conversation_messages)  # Add the actual conversation history
+    messages_api = [{"role": "system", "content": system_prompt}] + conversation_messages
 
     try:
         response = ollama.chat(
-            model='llama3.2',  # Ensure this model is pulled and available
-            messages=messages_for_ollama_api,
-            format="json"  # Ask Ollama to ensure the output is JSON
+            model='llama3.2',  # Or a specific version like llama3:8b. The user's log had llama3.2
+            messages=messages_api,
+            format="json",  # This is crucial for Ollama to try and enforce JSON output
+            options={"temperature": 0.0}  # Lower temperature for more deterministic command generation
         )
+        raw_response_content = response.get('message', {}).get('content', '')
 
-        raw_content = response['message']['content'].strip()
+        # Attempt to parse the JSON
+        data = json.loads(raw_response_content)
+        cmd = data.get("linuxcommand")
 
-        # When format="json", raw_content should be the JSON string itself.
-        try:
-            data = json.loads(raw_content)
-            if isinstance(data, dict) and "linuxcommand" in data:
-                return control_linux(data["linuxcommand"])
-            else:
-                # Fallback if AI didn't adhere to format="json" perfectly
-                print(f"⚠️ AI response was not the expected JSON structure despite format='json'. Raw: {raw_content}")
-                # Try to extract JSON if embedded (less robust)
-                json_start = raw_content.find('{')
-                json_end = raw_content.rfind('}') + 1
-                if json_start != -1 and json_end > json_start:
-                    json_str = raw_content[json_start:json_end]
-                    try:
-                        data_fallback = json.loads(json_str)
-                        if isinstance(data_fallback, dict) and "linuxcommand" in data_fallback:
-                            return control_linux(data_fallback["linuxcommand"])
-                    except json.JSONDecodeError:
-                        pass  # Fall through to main error
-                print(
-                    f"❌ 'linuxcommand' key not found or invalid structure in AI response. Parsed data: {data if 'data' in locals() else 'N/A'}")
-                return None
-        except json.JSONDecodeError as e:
-            print(f"❌ Invalid JSON received from AI even with format='json': {e}")
-            print(f"Raw AI output: {raw_content}")
-            return None
+        if cmd and isinstance(cmd, str) and cmd.strip():  # Ensure command is a non-empty string
+            print(f"🤖 AI Command: '{cmd}'")
+            return cmd.strip()  # Return stripped command
+
+        # If cmd is missing, not a string, or empty after stripping
+        error_reason = "Unknown issue"
+        if not cmd:
+            error_reason = "'linuxcommand' key missing or value is null"
+        elif not isinstance(cmd, str):
+            error_reason = "'linuxcommand' value is not a string"
+        elif not cmd.strip():
+            error_reason = "'linuxcommand' value is an empty string"
+
+        print(f"❌ AI Error (command generation): {error_reason} in response. Full data: {data}")
+        print(f"Raw response from AI (command generation): {raw_response_content}")
+        return None
+
+    except json.JSONDecodeError as e:
+        raw_content_for_log = raw_response_content if 'raw_response_content' in locals() else "N/A"
+        print(f"❌ JSON Decode Error (command generation): {e}. Raw AI response was: {raw_content_for_log}")
+        return None
+    except ollama.ResponseError as e:
+        print(
+            f"❌ Ollama API Error (command generation): {e.status_code} - {e.error if hasattr(e, 'error') else str(e)}")
+        return None
     except Exception as e:
-        print(f"❌ Error during Ollama API call: {e}")
+        print(f"❌ Unexpected Error (command generation): {e}")
         return None

@@ -1,172 +1,143 @@
 # main_docker_agent.py
+import json
 import docker
 import shlex
-# No direct need for 'json' or 'os' in this file with the current structure
+from Ollama_model import linux_command
+from Masterai import linux_step_planning
 
-from Ollama_model import linux_command  # Ensure this matches your file name
+
+def exec_cmd_in_container(container_ref, command_str):
+    """Runs command in container, returns (exit_code, stdout_str, stderr_str)."""
+    try:
+        exit_code, (out_bytes, err_bytes) = container_ref.exec_run(
+            f"bash -c {shlex.quote(command_str)}", demux=True, tty=False
+        )
+        stdout = out_bytes.decode('utf-8', 'ignore').strip() if out_bytes else ""
+        stderr = err_bytes.decode('utf-8', 'ignore').strip() if err_bytes else ""
+        return exit_code, stdout, stderr
+    except Exception as e:
+        return -1, "", f"Python error during exec: {e}"
+
 
 # --- Docker Setup ---
+container = None
 try:
     client = docker.from_env()
     client.ping()
-    print("✅ Docker client connected.")
+    print("✅ Docker connected.")
+    # Using a more common base image like ubuntu:22.04 or similar
+    # Ensure it has common tools or be prepared for the AI to install them
+    container = client.containers.run(
+        "ubuntu:latest", command="sleep infinity", tty=True, detach=True, remove=True
+    )
+    print(f"✅ Container '{container.name}' up.")
 except docker.errors.DockerException as e:
-    print(f"❌ Error connecting to Docker: {e}")
-    print("Please ensure Docker Desktop/Daemon is running and configured correctly.")
+    print(f"❌ Docker Error: {e}\nPlease ensure Docker is running.")
     exit(1)
 
-container = None
-
+# --- Agent State & Loop ---
+current_path = "/"
+messages = [] # Stores the history of interactions
 try:
-    print("🚀 Starting Ubuntu container...")
-    container = client.containers.run(
-        "ubuntu:latest",
-        command="sleep infinity",
-        tty=True,
-        detach=True,
-        remove=True  # Automatically remove container on stop
-    )
-    print(f"✅ Container '{container.name}' started with ID: {container.id}")
-
-    # --- Agent State ---
-    current_path = "/"
-    messages = []  # This will store the history of {"role": "user", "content": ...}
-    # and {"role": "assistant", "content": ...}
-
-    # --- Interaction Loop ---
     while True:
-        prompt_display_path = current_path if current_path else "/"
-        demande_ia = input(
-            f"\n[{container.name}:{prompt_display_path}]$ Décrivez l'action que vous souhaitez effectuer dans Ubuntu (ou 'exit' pour quitter) : ")
-        if demande_ia.lower() == "exit":
+        user_input = input(f"\n[{container.name}:{current_path}]$ ")
+        if user_input.lower() == "exit":
             print("👋 Exiting session.")
             break
 
-        messages.append({"role": "user", "content": demande_ia})
+        messages.append({"role": "user", "content": user_input})
 
-        print("🤔 Asking AI for command...")
-        # --- CRITICAL CHANGE HERE: Pass the `messages` list directly, and `current_path` ---
-        command = linux_command(messages, current_path)
+        print("🤔 AI (Planning)...")
+        # Pass the conversation history (messages) to the planner
+        parsed_plan = linux_step_planning(user_input, current_path, messages)
 
-        if not command:
-            print("❌ AI failed to generate a valid command. Please try rephrasing your request.")
-            if messages:  # Remove the last user message if AI failed
-                messages.pop()
-            continue
+        if parsed_plan:
+            print("\n--- Parsed Planning Steps ---")
+            print(json.dumps(parsed_plan, indent=2))
 
-        # Add AI's command to history for the next turn's context
-        messages.append({"role": "assistant", "content": command})
-
-        # --- Handle 'cd' command specifically ---
-        if command.startswith("cd "):
-            new_path_arg = command[3:].strip()
-
-            if any(char in new_path_arg for char in [';', '&&', '||', '|', '`', '$(']):
-                print(
-                    f"❌ Error: AI generated an invalid 'cd' command with multiple actions or dangerous characters: '{command}'")
-                print("   (The AI was asked for a single 'cd' operation).")
-                if len(messages) >= 2:
-                    messages.pop(); messages.pop()  # Pop assistant and user
-                elif messages:
-                    messages.pop()  # Pop only user if that's all left
+            steps = parsed_plan.get("linuxcommand", [])
+            if not steps:
+                print("ℹ️ AI planned no steps for the input.")
+                # Optional: Remove the last user message if no action is taken
+                # if messages and messages[-1]["role"] == "user": messages.pop()
                 continue
 
-            # Command to execute in bash: go to current_path, then attempt new_path_arg, then print new absolute path
-            cd_command_to_exec = f"cd {shlex.quote(current_path)} && cd {shlex.quote(new_path_arg)} && pwd -P"
+            all_steps_succeeded_for_this_plan = True
+            for step_description in steps:
+                print(f"\n➡️ Processing step: '{step_description}'")
 
-            print(f"⚙️ Executing CD command in container: '{cd_command_to_exec}'")
-            result = container.exec_run(f"bash -c {shlex.quote(cd_command_to_exec)}", demux=True)
-            stdout_bytes, stderr_bytes = result.output
+                current_step_context_for_llm = [{"role": "user", "content": step_description}]
 
-            if result.exit_code == 0:
-                old_path = current_path
-                # pwd -P output is the new current_path
-                new_resolved_path = stdout_bytes.decode('utf-8', errors='ignore').strip() if stdout_bytes else ""
+                print("🤔 AI (Generating Command)...")
+                ai_command = linux_command(current_step_context_for_llm, current_path)
 
-                if not new_resolved_path:  # Should not happen with pwd -P on success
-                    print(f"⚠️ CD command succeeded but 'pwd -P' gave no output. Path unchanged: '{current_path}'")
-                elif new_resolved_path == current_path:
-                    print(f"📁 Still in '{current_path}' (path did not change or was already correct).")
+                if not ai_command:
+                    print(f"❌ AI failed to generate command for step: '{step_description}'. Aborting rest of plan.")
+                    all_steps_succeeded_for_this_plan = False
+                    break
+
+                executed_successfully = False
+                if ai_command.startswith("cd "):
+                    path_arg = ai_command[3:].strip()
+                    if any(c in path_arg for c in [';', '&&', '||', '|', '`', '$(']):
+                        print(f"❌ Invalid 'cd' (multiple actions): '{ai_command}'")
+                        all_steps_succeeded_for_this_plan = False
+                        break
+
+                    cd_exec_str = f"cd {shlex.quote(current_path)} && cd {shlex.quote(path_arg)} && pwd -P"
+                    print(f"⚙️ Exec: '{ai_command}' (from '{current_path}')")
+                    ec, new_pwd, err_pwd = exec_cmd_in_container(container, cd_exec_str)
+
+                    if ec == 0 and new_pwd:
+                        if new_pwd != current_path:
+                            print(f"📁 Path changed to: {new_pwd}")
+                            current_path = new_pwd
+                        else:
+                            print(f"📁 Path unchanged: {current_path}")
+                        if err_pwd: print(f"⚠️ CD stderr: {err_pwd}")
+                        executed_successfully = True
+                    else:
+                        print(f"❌ CD Error: {err_pwd or 'Failed to change directory'}")
+                        all_steps_succeeded_for_this_plan = False
+                        break
                 else:
-                    current_path = new_resolved_path
-                    print(f"📁 Directory changed from '{old_path}' to '{current_path}'")
+                    full_command_to_run = f"cd {shlex.quote(current_path)} && {ai_command}"
+                    print(f"⚙️ Exec: '{ai_command}' (in '{current_path}')")
+                    ec, out, err = exec_cmd_in_container(container, full_command_to_run)
 
-                if stderr_bytes:  # Print any stderr from cd operation (e.g., bash warnings)
-                    stderr_str = stderr_bytes.decode('utf-8', errors='ignore').strip()
-                    if stderr_str: print(f"⚠️ CD stderr: {stderr_str}")
-            else:
-                error_output = stderr_bytes.decode('utf-8',
-                                                   errors='ignore').strip() if stderr_bytes else "unknown error (cd failed)"
-                print(f"❌ Error changing directory: {error_output}")
-                if len(messages) >= 2:
-                    messages.pop(); messages.pop()
-                elif messages:
-                    messages.pop()
-            continue  # Go back to input prompt
+                    if ec == 0:
+                        if out: print(f"🖥️ Stdout:\n{out}")
+                        if err: print(f"⚠️ Stderr:\n{err}")
+                        if not out and not err: print("✅ OK (no output).")
+                        executed_successfully = True
+                    else:
+                        print(f"❌ Command Error (code {ec}):")
+                        if err: print(f"Stderr:\n{err}")
+                        elif out: print(f"Stdout (error?):\n{out}")
+                        else: print("(No output from failed command)")
+                        all_steps_succeeded_for_this_plan = False
+                        break
 
-        # --- Execute other commands (non-cd) ---
-        # AI should generate commands relative to `current_path` due to the new system prompt.
-        # So, we still `cd` to `current_path` first to ensure the execution environment matches the AI's assumption.
-        full_command_for_exec = f"cd {shlex.quote(current_path)} && {command}"
+                if executed_successfully:
+                    messages.append({"role": "assistant", "content": ai_command})
 
-        print(f"⚙️ Executing command in container: '{full_command_for_exec}'")
-        try:
-            result = container.exec_run(
-                f"bash -c {shlex.quote(full_command_for_exec)}",
-                demux=True,
-                tty=False  # Usually False for non-interactive exec
-            )
-            stdout_bytes, stderr_bytes = result.output
+            if all_steps_succeeded_for_this_plan and steps:
+                print("\n✅ All planned steps executed successfully.")
+            elif steps:
+                print("\n⚠️ Plan execution stopped due to an error in one of the steps.")
 
-            # Process stdout
-            stdout_content = ""
-            if stdout_bytes is not None:
-                stdout_content = stdout_bytes.decode('utf-8', errors='ignore').strip()
-
-            # Process stderr
-            stderr_content = ""
-            if stderr_bytes is not None:
-                stderr_content = stderr_bytes.decode('utf-8', errors='ignore').strip()
-
-            if result.exit_code == 0:
-                if stdout_content:
-                    print("🖥️ Result (stdout):\n", stdout_content)
-                if stderr_content:  # Output warnings or other stderr even on success
-                    print("⚠️ Result (stderr):\n", stderr_content)
-                if not stdout_content and not stderr_content:
-                    print("✅ Command executed successfully with no output.")
-
-            else:  # Command failed
-                print(f"❌ Command exited with non-zero status ({result.exit_code}).")
-                if stderr_content:
-                    print("🖥️ Stderr:\n", stderr_content)
-                elif stdout_content:  # Some commands output errors to stdout
-                    print("🖥️ Stdout (error?):\n", stdout_content)
-                else:
-                    print("🖥️ (No output on stdout or stderr for the failed command)")
-
-                # Revert last user and assistant message on failure
-                if len(messages) >= 2:
-                    messages.pop(); messages.pop()
-                elif messages:
-                    messages.pop()
-
-        except Exception as e:  # Catch any other unexpected Python errors
-            print(f"❌ An unexpected Python error occurred during command execution: {e}")
-            if len(messages) >= 2:
-                messages.pop(); messages.pop()
-            elif messages:
-                messages.pop()
-
+        else:
+            print("❌ AI failed to generate a plan. Try rephrasing.")
+            # Optional: remove the last user message if planning failed entirely
+            # if messages and messages[-1]["role"] == "user" and messages[-1]["content"] == user_input:
+            #     messages.pop()
 finally:
-    # --- Cleanup ---
     if container:
-        print(f"\n🛑 Stopping container '{container.name}' ({container.id})...")
+        print(f"\n🛑 Stopping '{container.name}'...")
         try:
             container.stop()
-            # container.remove() is handled by 'remove=True' in run args
-            print("🗑️ Container stopped and removed.")
+            print("🗑️ Container stopped.")
         except docker.errors.NotFound:
-            print("Container already stopped or removed.")
+            print("Container already gone.")
         except Exception as e:
-            print(f"Error during container cleanup: {e}")
+            print(f"Error stopping container: {e}")
