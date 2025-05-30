@@ -2,248 +2,356 @@
 import json
 import docker
 import shlex
-import time  # Added for potential delays/retries if needed
-from datetime import datetime, timezone  # For timezone-aware UTC time
+from datetime import datetime, timezone
 from Ollama_model import linux_command
-from Masterai import linux_step_planning
+from Masterai import linux_step_planning, create_error_recovery_plan
+
+# Configuration constants
+UBUNTU_MIRROR = "http://mirror.csclub.uwaterloo.ca/ubuntu/"
+UBUNTU_VERSION = "jammy"
+DOCKER_IMAGE = "ubuntu:22.04"
+USER_LOGIN = "Felixcegep"
 
 
-# --- Helper Functions ---
-def exec_cmd_in_container(container_ref, command_str, log_prefix="⚙️ Exec:"):
-    """Runs command in container, returns (exit_code, stdout_str, stderr_str)."""
-    # Ensure DEBIAN_FRONTEND is set for apt commands if not already in command_str
-    # However, for general commands, it's not needed.
-    # For apt, it's better to prefix it in the command itself during setup.
-    full_command = f"bash -c {shlex.quote(command_str)}"
-    # print(f"{log_prefix} '{command_str}'") # Verbose logging if needed
+def get_current_time():
+    """Get current UTC time in specified format"""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def exec_cmd(container, command, current_path="/"):
+    """Execute command in container from current_path"""
+    full_cmd = f"cd {shlex.quote(current_path)} && {command}"
     try:
-        exit_code, (out_bytes, err_bytes) = container_ref.exec_run(
-            full_command, demux=True, tty=False
+        exit_code, (stdout, stderr) = container.exec_run(
+            f"bash -c {shlex.quote(full_cmd)}", demux=True
         )
-        stdout = out_bytes.decode('utf-8', 'ignore').strip() if out_bytes else ""
-        stderr = err_bytes.decode('utf-8', 'ignore').strip() if err_bytes else ""
-        return exit_code, stdout, stderr
+        out = stdout.decode('utf-8').strip() if stdout else ""
+        err = stderr.decode('utf-8').strip() if stderr else ""
+        return exit_code, out, err
     except Exception as e:
-        print(f"❌ Python error during exec: {e} (Command: {command_str})")
-        return -1, "", f"Python error during exec: {e}"
+        return -1, "", str(e)
 
 
-def perform_initial_container_setup(container_ref):
-    """Configures apt, Canadian mirrors, and updates the system in the container."""
-    print(f"🔧 Performing initial setup for container '{container_ref.name}'...")
+def setup_container(container):
+    """Setup Ubuntu container with Canadian mirror and updates"""
+    print("🔧 Setting up container...")
 
-    mirror_url = "http://mirror.csclub.uwaterloo.ca/ubuntu/"
-    release_name = "jammy"  # For Ubuntu 22.04
+    sources = f"""deb {UBUNTU_MIRROR} {UBUNTU_VERSION} main restricted universe multiverse
+deb {UBUNTU_MIRROR} {UBUNTU_VERSION}-updates main restricted universe multiverse
+deb {UBUNTU_MIRROR} {UBUNTU_VERSION}-backports main restricted universe multiverse
+deb {UBUNTU_MIRROR} {UBUNTU_VERSION}-security main restricted universe multiverse"""
 
-    sources_list_content = f"""
-deb {mirror_url} {release_name} main restricted universe multiverse
-deb {mirror_url} {release_name}-updates main restricted universe multiverse
-deb {mirror_url} {release_name}-backports main restricted universe multiverse
-deb {mirror_url} {release_name}-security main restricted universe multiverse
-"""
-    setup_steps = [
-        ("echo 'Setting up sources.list for Canadian mirror (Waterloo)...'",
-         f"echo {shlex.quote(sources_list_content)} > /etc/apt/sources.list"),
-        ("echo 'Cleaning up additional source lists directories...' && rm -f /etc/apt/sources.list.d/*",
-         "rm -f /etc/apt/sources.list.d/* || true"),  # Allow to pass if dir is empty or no files
-        (
-        "echo 'Ensuring DEBIAN_FRONTEND is noninteractive for apt operations...' && echo 'DEBIAN_FRONTEND=noninteractive' >> /etc/environment",
-        "echo 'DEBIAN_FRONTEND=noninteractive' >> /etc/environment"),
-        ("echo 'Updating package lists from new mirror...' && apt-get update -y",
-         "apt-get update -y"),
-        (
-        "echo 'Upgrading system packages (non-interactive)...' && apt-get upgrade -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold",
-        "apt-get upgrade -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"),
-        ("echo 'Cleaning up unused packages...' && apt-get autoremove -y && apt-get clean -y",
-         "apt-get autoremove -y && apt-get clean -y"),
-        ("echo 'Verifying apt configuration...' && apt-cache policy",  # Helps to see current sources
-         "apt-cache policy")
+    setup_commands = [
+        f"echo {shlex.quote(sources)} > /etc/apt/sources.list",
+        "rm -f /etc/apt/sources.list.d/* || true",
+        "echo 'DEBIAN_FRONTEND=noninteractive' >> /etc/environment",
+        "DEBIAN_FRONTEND=noninteractive apt-get update -y",
+        "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -o Dpkg::Options::=--force-confdef",
+        "DEBIAN_FRONTEND=noninteractive apt-get autoremove -y && apt-get clean -y"
     ]
 
-    for i, (log_msg, cmd) in enumerate(setup_steps):
-        print(f"🔄 [{i + 1}/{len(setup_steps)}] {log_msg}")
-        # Prefix with DEBIAN_FRONTEND for apt commands to be safe
-        exec_prefix = "DEBIAN_FRONTEND=noninteractive " if "apt-get" in cmd else ""
-        ec, out, err = exec_cmd_in_container(container_ref, exec_prefix + cmd, log_prefix=f"🔧 Setup:")
+    for i, cmd in enumerate(setup_commands, 1):
+        print(f"[{i}/{len(setup_commands)}] Running setup step...")
+        exit_code, out, err = exec_cmd(container, cmd)
+        if exit_code != 0:
+            print(f"❌ Setup failed: {err}")
+            container.stop()
+            raise RuntimeError(f"Container setup failed: {err}")
 
-        if ec != 0:
-            print(f"❌ Error during setup step: {cmd}")
-            print(f"   Exit Code: {ec}")
-            if out: print(f"   Stdout: {out}")
-            if err: print(f"   Stderr: {err}")
-            print("🚨 Initial container setup failed. Exiting.")
-            container_ref.stop()
-            container_ref.remove()
-            exit(1)
+    print("✅ Container setup complete")
+
+
+def handle_cd(container, command, current_path):
+    """Handle directory changes and return new path"""
+    target = command[3:].strip()
+
+    # Security check for command injection
+    dangerous_chars = [';', '&&', '||', '|', '`', '$(', '&', '<', '>']
+    if any(char in target for char in dangerous_chars):
+        print(f"❌ Invalid cd command: {command}")
+        return current_path
+
+    cd_cmd = f"cd {shlex.quote(current_path)} && cd {shlex.quote(target)} && pwd -P"
+    exit_code, new_path, err = exec_cmd(container, cd_cmd, "/")
+
+    if exit_code == 0 and new_path:
+        print(f"📁 Changed to: {new_path}")
+        return new_path
+    else:
+        print(f"❌ CD failed: {err}")
+        return current_path
+
+
+def execute_step(container, cmd, current_path):
+    """Execute a single step and return result info"""
+    if cmd.startswith("cd "):
+        new_path = handle_cd(container, cmd, current_path)
+        return {
+            "success": True,
+            "new_path": new_path,
+            "result": f"Changed directory to: {new_path}",
+            "output": "",
+            "error": ""
+        }
+    else:
+        print(f"⚙️ Running: {cmd}")
+        exit_code, out, err = exec_cmd(container, cmd, current_path)
+
+        if exit_code == 0:
+            if out: print(f"🖥️ Output:\n{out}")
+            if err: print(f"⚠️ Warnings:\n{err}")
+            if not out and not err: print("✅ OK")
+
+            return {
+                "success": True,
+                "new_path": current_path,
+                "result": f"Executed '{cmd}' successfully",
+                "output": out,
+                "error": err
+            }
         else:
-            if out and "apt-cache policy" not in cmd: print(
-                f"   ✅ Output: {out[:200]}...")  # Print some output for success
-            if err: print(f"   ⚠️ Stderr (Warning): {err}")  # Some apt commands produce warnings on stderr
-            print(f"   ✅ Step completed successfully.")
+            error_msg = err or out
+            print(f"❌ Failed (exit {exit_code}): {error_msg}")
+            return {
+                "success": False,
+                "new_path": current_path,
+                "result": f"Failed '{cmd}' - Error: {error_msg}",
+                "output": out,
+                "error": error_msg,
+                "exit_code": exit_code,
+                "failed_command": cmd
+            }
 
-    print("✅ Initial container setup completed successfully!")
+
+def execute_plan_with_recovery(container, steps, user_input, current_path, step_results, messages):
+    """Execute plan with automatic error recovery"""
+
+    for step_index, step in enumerate(steps, 1):
+        print(f"\n➡️ [{step_index}/{len(steps)}] {step}")
+
+        # Generate command with full context
+        print("🤔 Generating command...")
+        cmd = linux_command(
+            original_request=user_input,
+            current_step=step,
+            step_number=step_index,
+            total_steps=len(steps),
+            all_steps=steps,
+            previous_results=step_results,
+            current_path=current_path,
+            user_login=USER_LOGIN,
+            current_time=get_current_time()
+        )
+
+        if not cmd:
+            print("❌ No command generated")
+            return False, current_path
+
+        # Execute the command
+        execution_result = execute_step(container, cmd, current_path)
+        current_path = execution_result["new_path"]
+
+        if execution_result["success"]:
+            # Track successful results
+            step_results.append({
+                "step": step,
+                "command": cmd,
+                "result": execution_result["result"],
+                "output": execution_result["output"]
+            })
+            messages.append({"role": "assistant", "content": execution_result["result"]})
+        else:
+            # Handle failure with recovery
+            print("\n🔧 Attempting error recovery...")
+
+            recovery_success = attempt_error_recovery(
+                container, execution_result, user_input, step,
+                current_path, step_results, messages
+            )
+
+            if recovery_success:
+                # Retry the original step after recovery
+                print(f"\n🔄 Retrying original step: {step}")
+                retry_result = execute_step(container, cmd, current_path)
+                current_path = retry_result["new_path"]
+
+                if retry_result["success"]:
+                    step_results.append({
+                        "step": step,
+                        "command": cmd,
+                        "result": retry_result["result"],
+                        "output": retry_result["output"]
+                    })
+                    messages.append({"role": "assistant", "content": retry_result["result"]})
+                    print("✅ Recovery successful, continuing with plan")
+                else:
+                    print("❌ Recovery failed, stopping execution")
+                    return False, current_path
+            else:
+                print("❌ Could not recover from error, stopping execution")
+                return False, current_path
+
+    return True, current_path
+
+
+def attempt_error_recovery(container, execution_result, user_input, failed_step, current_path, step_results, messages):
+    """Attempt to recover from execution error"""
+
+    error_info = {
+        "failed_command": execution_result["failed_command"],
+        "error_message": execution_result["error"],
+        "exit_code": execution_result["exit_code"],
+        "failed_step": failed_step,
+        "current_path": current_path
+    }
+
+    print("🤔 Analyzing error and creating recovery plan...")
+    recovery_plan = create_error_recovery_plan(
+        error_info=error_info,
+        original_request=user_input,
+        step_results=step_results,
+        current_time=get_current_time()
+    )
+
+    if not recovery_plan or not recovery_plan.get("recovery_steps"):
+        print("❌ No recovery plan could be generated")
+        return False
+
+    recovery_steps = recovery_plan["recovery_steps"]
+    print(f"\n🛠️ Recovery Plan ({len(recovery_steps)} steps):")
+    for i, step in enumerate(recovery_steps, 1):
+        print(f"  [R{i}] {step}")
+
+    # Execute recovery steps
+    for step_index, recovery_step in enumerate(recovery_steps, 1):
+        print(f"\n🔧 [R{step_index}/{len(recovery_steps)}] {recovery_step}")
+
+        print("🤔 Generating recovery command...")
+        recovery_cmd = linux_command(
+            original_request=f"Recovery: {recovery_step}",
+            current_step=recovery_step,
+            step_number=step_index,
+            total_steps=len(recovery_steps),
+            all_steps=recovery_steps,
+            previous_results=step_results,
+            current_path=current_path,
+            user_login=USER_LOGIN,
+            current_time=get_current_time()
+        )
+
+        if not recovery_cmd:
+            print("❌ No recovery command generated")
+            return False
+
+        # Execute recovery command
+        recovery_result = execute_step(container, recovery_cmd, current_path)
+        current_path = recovery_result["new_path"]
+
+        if not recovery_result["success"]:
+            print(f"❌ Recovery step failed: {recovery_result['error']}")
+            return False
+
+        # Add recovery step to results
+        step_results.append({
+            "step": f"Recovery: {recovery_step}",
+            "command": recovery_cmd,
+            "result": recovery_result["result"],
+            "output": recovery_result["output"]
+        })
+        messages.append({"role": "assistant", "content": f"Recovery: {recovery_result['result']}"})
+
+    print("✅ Recovery plan completed successfully")
     return True
 
 
-# --- Docker Setup ---
-container = None
-client = None
-try:
-    client = docker.from_env()
-    client.ping()
-    print("✅ Docker connected.")
-
-    # Use a specific Ubuntu version for stability (Jammy Jellyfish)
-    image_name = "ubuntu:22.04"
-    print(f"🚀 Pulling Docker image '{image_name}' if not present (this might take a moment)...")
+def initialize_docker():
+    """Initialize Docker client and container"""
     try:
-        client.images.get(image_name)
-        print(f"✅ Image '{image_name}' found locally.")
-    except docker.errors.ImageNotFound:
-        print(f"Image '{image_name}' not found locally. Pulling...")
-        client.images.pull(image_name)
-        print(f"✅ Image '{image_name}' pulled successfully.")
+        client = docker.from_env()
+        client.ping()
+        print("✅ Docker connected")
 
-    container = client.containers.run(
-        image_name, command="sleep infinity", tty=True, detach=True, remove=True
-    )
-    print(f"✅ Container '{container.name}' (ID: {container.id[:12]}) is up from image '{image_name}'.")
-
-    # Perform initial setup
-    perform_initial_container_setup(container)
-
-except docker.errors.DockerException as e:
-    print(f"❌ Docker Error: {e}\nPlease ensure Docker is running and you have permissions.")
-    if container:  # If container was created but setup failed before this catch
         try:
-            container.stop()
-            # container.remove() # remove=True in run() handles this
-        except:
-            pass
-    exit(1)
-except Exception as e:
-    print(f"❌ An unexpected error occurred during setup: {e}")
-    if container:
-        try:
-            container.stop()
-        except:
-            pass
-    exit(1)
+            client.images.get(DOCKER_IMAGE)
+            print(f"✅ Image {DOCKER_IMAGE} found locally")
+        except docker.errors.ImageNotFound:
+            print(f"📥 Pulling {DOCKER_IMAGE}...")
+            client.images.pull(DOCKER_IMAGE)
+            print(f"✅ Image {DOCKER_IMAGE} pulled successfully")
 
-# --- Agent State & Loop ---
-current_path = "/"  # Default to root, as it's a clean container
-messages = []  # Stores the history of interactions
+        container = client.containers.run(
+            DOCKER_IMAGE, "sleep infinity", tty=True, detach=True, remove=True
+        )
+        print(f"✅ Container {container.name} started")
 
-try:
-    print(f"\n🎉 Docker Agent Ready. Current directory: {current_path}")
-    while True:
-        user_input = input(f"\n[{container.name}:{current_path}]$ ")
-        if user_input.lower() == "exit":
-            print("👋 Exiting session.")
-            break
+        setup_container(container)
+        return container
 
-        messages.append({"role": "user", "content": user_input})
+    except Exception as e:
+        print(f"❌ Docker initialization error: {e}")
+        raise
 
-        print("🤔 AI (Planning)...")
-        # Pass the conversation history (messages) to the planner
-        # Also pass current_path as planner might use it
-        parsed_plan = linux_step_planning(user_input, current_path, messages)
 
-        if parsed_plan and parsed_plan.get("linuxcommand"):
-            steps = parsed_plan.get("linuxcommand", [])
-            if not steps:
-                print("ℹ️ AI planned no steps for the input.")
-                if messages and messages[-1]["role"] == "user": messages.pop()  # Remove user message if no action
+def main():
+    """Main execution loop"""
+    container = None
+
+    try:
+        container = initialize_docker()
+        current_path = "/"
+        messages = []
+
+        print(f"\n🎉 Ready. Current directory: {current_path}")
+        print(f"📅 Current time: {get_current_time()} UTC")
+        print(f"👤 User: {USER_LOGIN}")
+
+        while True:
+            user_input = input(f"\n[{container.name}:{current_path}]$ ")
+            if user_input.lower() in ["exit", "quit", "q"]:
+                break
+
+            if not user_input.strip():
                 continue
 
-            print(f"\n📋 AI Plan ({len(steps)} steps):")
-            for i, step_desc in enumerate(steps): print(f"  [{i + 1}] {step_desc}")
+            messages.append({"role": "user", "content": user_input})
 
-            all_steps_succeeded = True
-            for step_description in steps:
-                print(f"\n➡️ Processing step: '{step_description}'")
+            # Get AI plan
+            print("🤔 Planning...")
+            plan = linux_step_planning(user_input, current_path, messages)
 
-                # Context for this specific step for command generation
-                current_step_context_for_llm = [{"role": "user", "content": step_description}]
+            if not plan or not plan.get("linuxcommand"):
+                print("❌ No plan generated")
+                messages.pop()
+                continue
 
-                print("🤔 AI (Generating Command)...")
-                ai_command = linux_command(current_step_context_for_llm, current_path)
+            steps = plan["linuxcommand"]
+            print(f"\n📋 Plan ({len(steps)} steps):")
+            for i, step in enumerate(steps, 1):
+                print(f"  [{i}] {step}")
 
-                if not ai_command:
-                    print(f"❌ AI failed to generate command for step: '{step_description}'. Aborting rest of plan.")
-                    all_steps_succeeded = False
-                    break
+            # Execute plan with automatic recovery
+            step_results = []
+            success, current_path = execute_plan_with_recovery(
+                container, steps, user_input, current_path, step_results, messages
+            )
 
-                # Special handling for 'cd'
-                if ai_command.startswith("cd "):
-                    path_arg = ai_command[3:].strip()
-                    # Basic validation for cd to prevent complex chained commands via 'cd'
-                    if any(c in path_arg for c in [';', '&&', '||', '|', '`', '$(']):
-                        print(f"❌ Invalid 'cd' (potential multiple actions): '{ai_command}'. Skipping.")
-                        all_steps_succeeded = False  # Or just skip this step and continue
-                        break  # Or continue, depending on desired strictness
+            print(
+                f"\n{'✅ All steps completed successfully' if success else '⚠️ Execution failed and could not be recovered'}")
 
-                    # To correctly resolve paths (absolute, relative, ..), execute `cd` and then `pwd`
-                    # Ensure `cd` is relative to current_path first
-                    cd_exec_str = f"cd {shlex.quote(current_path)} && cd {shlex.quote(path_arg)} && pwd -P"
-                    print(f"⚙️ Exec (cd): '{ai_command}' (from '{current_path}')")
-                    ec, new_pwd, err_pwd = exec_cmd_in_container(container, cd_exec_str, log_prefix="💿 CD Exec:")
+    except KeyboardInterrupt:
+        print("\n🛑 Interrupted by user")
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+    finally:
+        if container:
+            print(f"\n🛑 Stopping container...")
+            try:
+                container.stop()
+                print("🗑️ Container stopped")
+            except Exception as e:
+                print(f"⚠️ Error stopping container: {e}")
+        print("👋 Goodbye")
 
-                    if ec == 0 and new_pwd:
-                        if new_pwd != current_path:
-                            print(f"📁 Path changed to: {new_pwd}")
-                            current_path = new_pwd
-                        else:
-                            print(f"📁 Path unchanged: {current_path}")
-                        if err_pwd: print(f"⚠️ CD stderr: {err_pwd}")
-                        messages.append({"role": "assistant",
-                                         "content": f"Changed directory to {current_path}"})  # Log successful cd
-                    else:
-                        print(f"❌ CD Error: {err_pwd or 'Failed to change directory'}")
-                        all_steps_succeeded = False
-                        break
-                else:
-                    # Prepend `cd` to the current path for other commands
-                    full_command_to_run = f"cd {shlex.quote(current_path)} && {ai_command}"
-                    print(f"⚙️ Exec: '{ai_command}' (in '{current_path}')")
-                    ec, out, err = exec_cmd_in_container(container, full_command_to_run)
 
-                    if ec == 0:
-                        if out: print(f"🖥️ Stdout:\n{out}")
-                        if err: print(
-                            f"⚠️ Stderr:\n{err}")  # Often, successful commands might output to stderr (e.g., progress)
-                        if not out and not err: print("✅ OK (no output).")
-                        messages.append({"role": "assistant",
-                                         "content": f"Executed: {ai_command}\nOutput:\n{out}\nError (if any):\n{err}"})
-                    else:
-                        print(f"❌ Command Error (code {ec}):")
-                        if err:
-                            print(f"Stderr:\n{err}")
-                        elif out:
-                            print(f"Stdout (error?):\n{out}")  # Sometimes errors go to stdout
-                        else:
-                            print("(No output from failed command)")
-                        all_steps_succeeded = False
-                        break  # Stop plan on error
-
-            if all_steps_succeeded and steps:
-                print("\n✅ All planned steps executed successfully.")
-            elif steps:  # Implies not all_steps_succeeded
-                print("\n⚠️ Plan execution stopped due to an error in one of the steps.")
-
-        else:
-            print("❌ AI failed to generate a plan or plan was empty. Try rephrasing or a different task.")
-            if messages and messages[-1]["role"] == "user": messages.pop()
-
-finally:
-    if container:
-        print(f"\n🛑 Stopping container '{container.name}'...")
-        try:
-            container.stop()
-            # container.remove() # remove=True in run() ensures it's removed on stop or Docker daemon exit
-            print("🗑️ Container stopped and will be removed.")
-        except docker.errors.NotFound:
-            print("ℹ️ Container already gone.")
-        except Exception as e:
-            print(f"Error stopping/removing container: {e}")
-    print("👋 Session ended.")
+if __name__ == "__main__":
+    main()

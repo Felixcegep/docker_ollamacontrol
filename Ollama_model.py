@@ -1,128 +1,103 @@
+# Ollama_model.py
 import ollama
 import json
-import re
-from datetime import datetime, timezone
 
 
-def linux_command(conversation_messages, current_path):
-    """Generate appropriate Linux command based on user input"""
+def linux_command(original_request, current_step, step_number, total_steps, all_steps,
+                  previous_results, current_path, user_login, current_time):
+    """Generate Linux command with full context"""
 
-    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    current_user = "Felixcegep"
+    # Build context from previous steps
+    previous_context = ""
+    if previous_results:
+        previous_context = "\nPrevious steps completed:\n"
+        for result in previous_results:
+            previous_context += f"- {result['step']}: {result['command']} → {result['result']}\n"
 
-    system_prompt = f"""Generate ONE Linux command for Ubuntu Docker container (root shell).
-Current directory: '{current_path}'
-Current Date/Time (UTC): {current_time}
-Current User: {current_user}
+    # Build full plan overview
+    all_steps_text = "\n".join([f"{i + 1}. {step}" for i, step in enumerate(all_steps)])
 
-COMMAND GENERATION RULES:
-- Generate the EXACT command needed for the user's request
-- Use apt-get instead of apt for scripts
-- Use DEBIAN_FRONTEND=noninteractive for package operations
-- Output ONLY JSON: {{"linuxcommand": "command here"}}
-- NO explanations or extra text
+    # Create comprehensive prompt
+    prompt = f"""Generate ONE Linux command for Ubuntu container.
 
-COMMON PATTERNS:
-- Check if package installed: "which PACKAGE" or "dpkg -l | grep PACKAGE"
-- Install packages: "DEBIAN_FRONTEND=noninteractive apt-get install -y PACKAGE"
-- Create folder: "mkdir -p FOLDERNAME"
-- List files: "ls -la" or "ls -l"
-- Show current directory: "pwd"
-- Check file existence: "ls -la FILENAME" or "test -f FILENAME && echo 'exists' || echo 'not found'"
-- Show version: "COMMAND --version"
-- Create file: "touch FILENAME" or "echo 'content' > FILENAME"
-- Move/copy: "mv SOURCE DEST" or "cp SOURCE DEST"
+ORIGINAL USER REQUEST: "{original_request}"
 
-EXAMPLES based on user requests:
-User: "check if wget is installed" → {{"linuxcommand": "which wget"}}
-User: "which wget" → {{"linuxcommand": "which wget"}}
-User: "make a new folder" → {{"linuxcommand": "mkdir -p new_folder"}}
-User: "create directory called projects" → {{"linuxcommand": "mkdir -p projects"}}
-User: "install curl" → {{"linuxcommand": "DEBIAN_FRONTEND=noninteractive apt-get install -y curl"}}
-User: "list files" → {{"linuxcommand": "ls -la"}}
-User: "show current directory" → {{"linuxcommand": "pwd"}}
-User: "create file test.txt" → {{"linuxcommand": "touch test.txt"}}"""
+FULL PLAN:
+{all_steps_text}
 
-    max_retries = 3
+CURRENT CONTEXT:
+- Current directory: {current_path}
+- Current step: {step_number}/{total_steps}
+- Current step description: "{current_step}"
+- Date/Time (UTC - YYYY-MM-DD HH:MM:SS formatted): {current_time}
+- Current User's Login: {user_login}
+{previous_context}
 
-    for attempt in range(max_retries):
-        try:
-            response = ollama.chat(
-                model='llama3.2',
-                messages=[{"role": "system", "content": system_prompt}] + conversation_messages,
-                format="json",
-                options={
-                    "temperature": 0.1,  # Slightly higher for better variety
-                    "top_p": 0.9,
-                    "num_predict": 100
-                }
-            )
+CRITICAL REQUIREMENTS:
+1. Generate command for ONLY the current step: "{current_step}"
+2. Consider what was accomplished in previous steps
+3. Use exact names/paths from previous step outputs
+4. Ensure consistency across all steps
 
-            content = response.get('message', {}).get('content', '').strip()
+RULES:
+- Output JSON only: {{"linuxcommand": "command"}}
+- Use apt-get not apt
+- Add DEBIAN_FRONTEND=noninteractive for package installs
+- Use mkdir -p for directories
+- For cd commands, use exact folder names from previous steps
+- For Python virtual environments, ensure python3-venv is installed first
 
-            if not content:
-                if attempt < max_retries - 1:
-                    print(f"⚠️ Empty response, retrying ({attempt + 1}/{max_retries})")
-                    continue
-                return None
+EXAMPLES:
+Previous created "project_folder" + current "go into project folder" → {{"linuxcommand": "cd project_folder"}}
+Current "create project directory" → {{"linuxcommand": "mkdir -p project_folder"}}
+Current "install curl package" → {{"linuxcommand": "DEBIAN_FRONTEND=noninteractive apt-get install -y curl"}}
+Current "install python3-venv package" → {{"linuxcommand": "DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv"}}
+Current "create virtual environment" → {{"linuxcommand": "python3 -m venv myenv"}}
+Current "list files" → {{"linuxcommand": "ls -la"}}"""
 
-            # Clean and parse JSON
-            content = clean_json_response(content)
-            data = json.loads(content)
-            cmd = data.get("linuxcommand", "").strip()
+    try:
+        response = ollama.chat(
+            model='qwen2.5-coder:7b',
+            messages=[{"role": "user", "content": prompt}],
+            format="json",
+            options={"temperature": 0.1, "top_p": 0.9}
+        )
 
-            if not cmd:
-                if attempt < max_retries - 1:
-                    print(f"⚠️ Empty command, retrying ({attempt + 1}/{max_retries})")
-                    continue
-                return None
+        content = response.get('message', {}).get('content', '').strip()
 
-            # Optimize the command
+        # Extract JSON from response
+        if '{' in content:
+            start = content.find('{')
+            end = content.rfind('}') + 1
+            content = content[start:end]
+
+        data = json.loads(content)
+        cmd = data.get("linuxcommand", "").strip()
+
+        if cmd:
+            # Apply command optimizations
             cmd = optimize_command(cmd)
-
-            print(f"🤖 AI Command: '{cmd}'")
+            print(f"🤖 Command: {cmd}")
             return cmd
-
-        except json.JSONDecodeError as e:
-            if attempt < max_retries - 1:
-                print(f"⚠️ JSON error, retrying ({attempt + 1}/{max_retries})")
-                continue
-            print(f"❌ JSON decode error: {e}")
+        else:
+            print("❌ Empty command in response")
             return None
 
-        except Exception as e:
-            if attempt < max_retries - 1:
-                print(f"⚠️ Error, retrying ({attempt + 1}/{max_retries}): {e}")
-                continue
-            print(f"❌ Command generation error: {e}")
-            return None
-
-    return None
-
-
-def clean_json_response(content):
-    """Clean up JSON formatting"""
-    # Find JSON object boundaries
-    if '{' in content:
-        start = content.find('{')
-        end = content.rfind('}') + 1
-        content = content[start:end]
-
-    # Fix common escape issues
-    content = content.replace('\\"', '"')
-    content = content.replace('\\n', '\\\\n')
-
-    return content.strip()
+    except json.JSONDecodeError as e:
+        print(f"❌ JSON parsing error: {e}")
+        return None
+    except Exception as e:
+        print(f"❌ Command generation error: {e}")
+        return None
 
 
 def optimize_command(cmd):
-    """Optimize commands for better execution"""
-
-    # Replace apt with apt-get for scripts
+    """Apply standard optimizations to commands"""
+    # Replace apt with apt-get for scripting
     if cmd.startswith('apt '):
         cmd = cmd.replace('apt ', 'apt-get ', 1)
 
-    # Add DEBIAN_FRONTEND for apt operations if not present
+    # Add DEBIAN_FRONTEND for apt installs
     if 'apt-get install' in cmd and 'DEBIAN_FRONTEND' not in cmd:
         cmd = f'DEBIAN_FRONTEND=noninteractive {cmd}'
 
@@ -130,27 +105,10 @@ def optimize_command(cmd):
     if cmd.startswith('mkdir ') and '-p' not in cmd:
         cmd = cmd.replace('mkdir ', 'mkdir -p ', 1)
 
+    # Add -y flag to apt-get operations if missing
+    if 'apt-get' in cmd and cmd.endswith('apt-get update'):
+        cmd += ' -y'
+    elif 'apt-get install' in cmd and ' -y' not in cmd:
+        cmd = cmd.replace('install', 'install -y')
+
     return cmd
-
-
-# Test function to verify command generation
-def test_command_generation():
-    """Test various user inputs"""
-    test_cases = [
-        [{"role": "user", "content": "check if wget is installed"}],
-        [{"role": "user", "content": "which wget"}],
-        [{"role": "user", "content": "make a new folder"}],
-        [{"role": "user", "content": "create directory called projects"}],
-        [{"role": "user", "content": "install python3"}],
-        [{"role": "user", "content": "list files"}],
-        [{"role": "user", "content": "show current directory"}]
-    ]
-
-    for test in test_cases:
-        print(f"\nTesting: {test[0]['content']}")
-        result = linux_command(test, "/")
-        print(f"Result: {result}")
-
-# Uncomment to test
-# if __name__ == "__main__":
-#     test_command_generation()
