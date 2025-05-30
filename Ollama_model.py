@@ -1,11 +1,10 @@
-# Ollama_model.py
 import ollama
 import json
 
 
 def linux_command(original_request, current_step, step_number, total_steps, all_steps,
-                  previous_results, current_path, user_login, current_time):
-    """Generate Linux command with full context"""
+                  previous_results, current_path, user_login, current_time, container_state=None):
+    """Generate Linux command with full context and intelligence"""
 
     # Build context from previous steps
     previous_context = ""
@@ -14,11 +13,21 @@ def linux_command(original_request, current_step, step_number, total_steps, all_
         for result in previous_results:
             previous_context += f"- {result['step']}: {result['command']} → {result['result']}\n"
 
+    # Build container state context
+    state_context = ""
+    if container_state:
+        state_context = f"""
+CONTAINER STATE AWARENESS:
+- Existing directories: {', '.join(container_state.get('directories', [])) or 'none'}
+- Existing files: {', '.join(container_state.get('files', [])) or 'none'}
+- Python packages installed: {', '.join(container_state.get('python_packages', [])) or 'none'}
+"""
+
     # Build full plan overview
     all_steps_text = "\n".join([f"{i + 1}. {step}" for i, step in enumerate(all_steps)])
 
     # Create comprehensive prompt
-    prompt = f"""Generate ONE Linux command for Ubuntu container.
+    prompt = f"""Generate ONE INTELLIGENT Linux command for Ubuntu container.
 
 ORIGINAL USER REQUEST: "{original_request}"
 
@@ -31,29 +40,32 @@ CURRENT CONTEXT:
 - Current step description: "{current_step}"
 - Date/Time (UTC - YYYY-MM-DD HH:MM:SS formatted): {current_time}
 - Current User's Login: {user_login}
-{previous_context}
+{state_context}{previous_context}
 
-CRITICAL REQUIREMENTS:
-1. Generate command for ONLY the current step: "{current_step}"
-2. Consider what was accomplished in previous steps
-3. Use exact names/paths from previous step outputs
-4. Ensure consistency across all steps
+CRITICAL INTELLIGENCE RULES:
+1. For Python packages (pytest, requests, flask, etc.) → Use pip3 install [package]
+2. For system packages (python3-pip, git, curl, etc.) → Use apt-get install [package]
+3. For file creation with content → Use echo 'content' > filename (NOT nano/vim)
+4. For directory navigation → Use exact paths from previous steps
+5. Check container state - don't create existing files/directories
+6. Ensure pip3 is available before installing Python packages
 
-RULES:
+COMMAND GENERATION RULES:
 - Output JSON only: {{"linuxcommand": "command"}}
-- Use apt-get not apt
-- Add DEBIAN_FRONTEND=noninteractive for package installs
-- Use mkdir -p for directories
-- For cd commands, use exact folder names from previous steps
-- For Python virtual environments, ensure python3-venv is installed first
+- Use apt-get not apt for system packages
+- Add DEBIAN_FRONTEND=noninteractive for apt-get installs
+- Use mkdir -p for directories (but check if they exist first)
+- Use echo commands for file content, never interactive editors
+- Use pip3 for Python packages, apt-get for system packages
 
-EXAMPLES:
-Previous created "project_folder" + current "go into project folder" → {{"linuxcommand": "cd project_folder"}}
-Current "create project directory" → {{"linuxcommand": "mkdir -p project_folder"}}
-Current "install curl package" → {{"linuxcommand": "DEBIAN_FRONTEND=noninteractive apt-get install -y curl"}}
-Current "install python3-venv package" → {{"linuxcommand": "DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv"}}
-Current "create virtual environment" → {{"linuxcommand": "python3 -m venv myenv"}}
-Current "list files" → {{"linuxcommand": "ls -la"}}"""
+INTELLIGENT EXAMPLES:
+"Install pytest using pip3" → {{"linuxcommand": "pip3 install pytest"}}
+"Install python3-pip system package" → {{"linuxcommand": "DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip"}}
+"Create src/main.py with add function" → {{"linuxcommand": "echo 'def add(a, b):\\n    return a + b' > src/main.py"}}
+"Run pytest on tests directory" → {{"linuxcommand": "python3 -m pytest tests/"}}
+"Check if pytest is installed" → {{"linuxcommand": "pip3 show pytest"}}
+"Create project directory" (if src exists) → {{"linuxcommand": "echo 'Directory src already exists'"}}
+"Navigate to project directory" → {{"linuxcommand": "cd testpy"}}"""
 
     try:
         response = ollama.chat(
@@ -75,8 +87,8 @@ Current "list files" → {{"linuxcommand": "ls -la"}}"""
         cmd = data.get("linuxcommand", "").strip()
 
         if cmd:
-            # Apply command optimizations
-            cmd = optimize_command(cmd)
+            # Apply intelligent command optimizations
+            cmd = optimize_command_intelligently(cmd, container_state)
             print(f"🤖 Command: {cmd}")
             return cmd
         else:
@@ -91,8 +103,21 @@ Current "list files" → {{"linuxcommand": "ls -la"}}"""
         return None
 
 
-def optimize_command(cmd):
-    """Apply standard optimizations to commands"""
+def optimize_command_intelligently(cmd, container_state=None):
+    """Apply intelligent optimizations to commands"""
+
+    # Skip if trying to create existing directories
+    if container_state and cmd.startswith('mkdir -p '):
+        dir_name = cmd.replace('mkdir -p ', '').strip()
+        if dir_name in container_state.get('directories', []):
+            return f"echo 'Directory {dir_name} already exists'"
+
+    # Skip if trying to create existing files
+    if container_state and cmd.startswith('touch '):
+        file_name = cmd.replace('touch ', '').strip()
+        if file_name in container_state.get('files', []):
+            return f"echo 'File {file_name} already exists'"
+
     # Replace apt with apt-get for scripting
     if cmd.startswith('apt '):
         cmd = cmd.replace('apt ', 'apt-get ', 1)
@@ -110,5 +135,12 @@ def optimize_command(cmd):
         cmd += ' -y'
     elif 'apt-get install' in cmd and ' -y' not in cmd:
         cmd = cmd.replace('install', 'install -y')
+
+    # Fix common Python package installation mistakes
+    if 'apt-get install' in cmd:
+        python_packages = ['pytest', 'requests', 'flask', 'django', 'numpy', 'pandas']
+        for pkg in python_packages:
+            if pkg in cmd:
+                return f"pip3 install {pkg}"
 
     return cmd
